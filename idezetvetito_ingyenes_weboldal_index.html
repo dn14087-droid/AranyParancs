@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Idézetvetítő</title>
+  <meta name="description" content="Közösségi idézetvetítő háttérzenével – Google Sheets Approved fülről olvas, csak az Idézet oszlopot használja." />
+  <style>
+    :root{--bg:#0b0f17;--fg:#e7ecf2;--muted:#9aa6b2;--brand:#6ad1ff}
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,Helvetica,Arial;display:flex;flex-direction:column;min-height:100dvh;background:#0b0f17;color:var(--fg)}
+    header{padding:10px;background:#121826;display:flex;gap:.5rem;justify-content:center;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+    header button, header a{padding:8px 14px;border:none;border-radius:10px;cursor:pointer;font-weight:700;background:#1f2a3a;color:white;box-shadow:0 1px 0 rgba(255,255,255,.06) inset;text-decoration:none;display:inline-flex;align-items:center}
+    header button.primary{background:linear-gradient(135deg,var(--brand),#c68cff);color:#051019}
+    main{flex:1;display:grid;place-items:center;padding:24px}
+    blockquote{margin:0;font-size:clamp(26px,4.8vw,54px);line-height:1.25;text-align:center;max-width:1100px}
+    .ticker{padding:8px 12px;background:#0f131c;display:flex;align-items:center;gap:.6rem;font-size:.95rem;border-top:1px solid rgba(255,255,255,.06)}
+    .status-dot{width:10px;height:10px;border-radius:50%;background:#e15}
+    .status-dot.ok{background:#28d47b}
+    .muted{color:var(--muted)}
+  </style>
+</head>
+<body>
+  <header>
+    <button id="btnStart" class="primary" title="Lejátszás & vetítés indítása">Indítás</button>
+    <button id="btnPrev" title="Előző">⟨⟨</button>
+    <button id="btnNext" title="Következő">⟩⟩</button>
+    <button id="btnShuffle" title="Véletlenszerű / sorrendi">Shuffle</button>
+    <button id="btnPause" title="Szünet">Szünet</button>
+    <a id="btnSubmit" href="#" target="_blank" rel="noopener" title="Új idézet beküldése">Beküldés</a>
+  </header>
+
+  <main>
+    <blockquote id="quote">Töltsd be az idézeteket az Indítás gombbal.</blockquote>
+  </main>
+
+  <div class="ticker">
+    <div class="status-dot" id="status"></div>
+    <span id="statusText">Készen áll.</span>
+    <span class="muted" id="hint" style="margin-left:auto">Tipp: Állítsd a <code>RAW_SPREADSHEET_ID</code>-t a Google Táblázat **ID**-jára, és a lapot tedd közzé a weben.</span>
+  </div>
+
+  <audio id="bgm" loop preload="auto"></audio>
+
+  <script>
+    // ======= KONFIG (TÖLTSD KI) =======
+    const RAW_SPREADSHEET_ID = "1CLtPyw8KGKxRPNdQWRBncM3ldmNMGPPDdl8HgAm0eFQ";
+    const SHEET_NAME = "Approved";
+    const FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSePpqMxLh6pd5sDtclIAuZ5Ba8_LsD5YbJxlhbuIO4L-WZpxw/viewform?usp=dialog";
+    const AUDIO_URL = "https://docs.google.com/uc?export=download&id=1m5Bc_w5xTVscoKN9gTYl4Az7rKYRkW9a";
+    const SLIDE_SECONDS = 8;
+    const MAX_RECENT = 5;
+
+    function sanitizeSheetId(input){
+      if(!input) return "";
+      const m = String(input).match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+      return m ? m[1] : String(input).trim();
+    }
+    function gvizUrl(sheetId, sheetName){
+      return `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(sheetName)}`;
+    }
+    function looksLikeHtml(str){
+      const s = String(str||'').trim().toLowerCase();
+      return s.startsWith('<!doctype') || s.startsWith('<html') || s.includes('<body');
+    }
+    function parseGViz(raw){
+      const text = String(raw);
+      let m = text.match(/google\.visualization\.[^.]+\.set(?:Data)?Response\(([^]*)\);?/);
+      if(m && m[1]){
+        return JSON.parse(m[1]);
+      }
+      const first = text.indexOf('{');
+      const last  = text.lastIndexOf('}');
+      if(first !== -1 && last !== -1 && last > first){
+        return JSON.parse(text.slice(first, last+1));
+      }
+      throw new Error('Nem sikerült parse-olni a választ (nem GViz JSON).');
+    }
+
+    const els = {
+      quote: document.getElementById('quote'),
+      statusDot: document.getElementById('status'),
+      statusText: document.getElementById('statusText'),
+      hint: document.getElementById('hint'),
+      bgm: document.getElementById('bgm'),
+      btnStart: document.getElementById('btnStart'),
+      btnNext: document.getElementById('btnNext'),
+      btnPrev: document.getElementById('btnPrev'),
+      btnPause: document.getElementById('btnPause'),
+      btnShuffle: document.getElementById('btnShuffle'),
+      btnSubmit: document.getElementById('btnSubmit'),
+    };
+    const state = { quotes: [], idx: 0, timer: null, shuffling: true, started: false, recent: [] };
+    const SPREADSHEET_ID = sanitizeSheetId(RAW_SPREADSHEET_ID);
+
+    if(AUDIO_URL && !AUDIO_URL.includes('PASTE_')){
+      els.bgm.src = AUDIO_URL;
+    } else {
+      els.hint.textContent = 'Tipp: Adj meg AUDIO_URL-t (.mp3), hogy szóljon a háttérzene.';
+    }
+
+    if(FORM_URL && !FORM_URL.includes('PASTE_')){
+      els.btnSubmit.href = FORM_URL;
+    } else {
+      els.btnSubmit.style.display = 'none';
+      els.hint.textContent = 'Tipp: Adj meg FORM_URL-t (Google Űrlap link), hogy megjelenjen a Beküldés gomb.';
+    }
+
+    async function fetchQuotes(){
+      setStatus('Idézetek betöltése...');
+      try{
+        if(!SPREADSHEET_ID) throw new Error('Hiányzik a táblázat azonosító (RAW_SPREADSHEET_ID).');
+        const url = gvizUrl(SPREADSHEET_ID, SHEET_NAME);
+        const res = await fetch(url, { cache: 'no-store' });
+        if(!res.ok){ throw new Error(`Hálózati hiba: ${res.status} ${res.statusText}`); }
+        const raw = await res.text();
+        if(looksLikeHtml(raw)){
+          throw new Error('HTML érkezett: rossz ID vagy a munkalap nincs közzétéve a weben.');
+        }
+        const json = parseGViz(raw);
+        const table = json?.table || {};
+        const cols  = (table.cols || []).map(c => (c?.label || '').toString().trim().toLowerCase());
+        const rows  = table.rows || [];
+
+        function findCol(names){
+          for(const n of names){
+            const i = cols.findIndex(l => l.includes(n));
+            if(i !== -1) return i;
+          }
+          return -1;
+        }
+        const tsIdx    = findCol(['időbélyeg','idobelyeg','timestamp','time','dátum','datum']);
+        let quoteIdx   = findCol(['idézet','idezet','quote','szöveg','szoveg','text']);
+        if(quoteIdx === -1){
+          const candidates = cols.map((_,i)=>i).filter(i => i !== tsIdx);
+          quoteIdx = candidates.length ? candidates[0] : 0;
+        }
+
+        const isDateish = (s)=>{ const t = String(s||'').trim(); return /^[0-9\s:\.\/-]{8,25}$/.test(t); };
+
+        const out = [];
+        for(const r of rows){
+          const c = r.c || [];
+          const textRaw = c[quoteIdx]?.v ?? '';
+          const text = String(textRaw).trim();
+          if(!text) continue;
+          if(['idézet','quote','text','szöveg','szoveg'].includes(text.toLowerCase())) continue;
+          if(isDateish(text)) continue;
+          out.push({text, author: ''});
+        }
+        if(!out.length) throw new Error('Nem találtam idézeteket az Approved fülön.');
+
+        state.quotes = out;
+        setStatus(`Betöltve ${out.length} idézet.`, true);
+        return out;
+      }catch(err){
+        console.error(err);
+        setStatus(err.message || 'Betöltési hiba – minta idézetekkel.', false);
+        state.quotes = [ {text:'„Az út maga a cél.”'}, {text:'„Ahol akarat van, ott út is van.”'} ];
+        return state.quotes;
+      }
+    }
+
+    function setStatus(msg, ok){ els.statusText.textContent = msg; els.statusDot.classList.toggle('ok', !!ok); }
+
+    function pickNextIndex(){
+      if(!state.quotes.length) return 0;
+      if(!state.shuffling){ state.idx = (state.idx + 1) % state.quotes.length; return state.idx; }
+      let next, tries=0;
+      do{ next = Math.floor(Math.random()*state.quotes.length); tries++; if(tries>50) break; } while(state.recent.includes(next));
+      state.recent.push(next); if(state.recent.length>MAX_RECENT) state.recent.shift();
+      state.idx = next; return next;
+    }
+
+    function show(idx){ els.quote.textContent = state.quotes[idx]?.text || ''; }
+
+    function startShow(){
+      if(!state.started){
+        state.started = true;
+        if(AUDIO_URL && !AUDIO_URL.includes('PASTE_')){ els.bgm.play().catch(()=>{}); }
+      }
+      clearInterval(state.timer);
+      show(pickNextIndex());
+      state.timer = setInterval(()=>show(pickNextIndex()), SLIDE_SECONDS*1000);
+      setStatus('Vetítés folyamatban…', true);
+    }
+
+    function pauseShow(){ clearInterval(state.timer); setStatus('Szünetelve.', false); }
+
+    els.btnStart.addEventListener('click', async ()=>{ if(!state.quotes.length) await fetchQuotes(); startShow(); });
+    els.btnNext .addEventListener('click', ()=>{ if(!state.quotes.length) return; pauseShow(); show(pickNextIndex()); });
+    els.btnPrev .addEventListener('click', ()=>{ if(!state.quotes.length) return; pauseShow(); state.idx=(state.idx-1+state.quotes.length)%state.quotes.length; show(state.idx); });
+    els.btnPause.addEventListener('click', ()=>{ pauseShow(); els.bgm.pause(); });
+    els.btnShuffle.addEventListener('click', ()=>{ state.shuffling=!state.shuffling; setStatus(state.shuffling?'Shuffle: BE':'Shuffle: KI'); });
+  </script>
+</body>
+</html>
